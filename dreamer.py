@@ -16,6 +16,7 @@ import models
 import tools
 import envs.wrappers as wrappers
 from parallel import Parallel, Damy
+from envs.legged_robots import LeggedRobot
 
 import torch
 from torch import nn
@@ -145,7 +146,26 @@ def make_dataset(episodes, config):
 
 def make_env(config, mode, id):
     suite, task = config.task.split("_", 1)
-    if suite == "dmc":
+
+    # ~~~~~~~~~~~~~~~~~~~ real robots ~~~~~~~~~~~~~~~~~~~ #
+    if suite == "a1":
+        assert config.size == (64, 64), config.size
+        env = LeggedRobot(
+            task, robot_type='A1', repeat=config.action_repeat,
+        )
+    elif suite == "go1":
+        assert config.size == (64, 64), config.size
+        env = LeggedRobot(
+            task, robot_type='Go1', repeat=config.action_repeat,
+        )
+    elif suite == "aliengo":
+        assert config.size == (64, 64), config.size
+        env = LeggedRobot(
+            task, robot_type='Aliengo', repeat=config.action_repeat,
+        )
+    # ~~~~~~~~~~~~~~~~~~~ real robots ~~~~~~~~~~~~~~~~~~~ #
+
+    elif suite == "dmc":
         import envs.dmc as dmc
 
         env = dmc.DeepMindControl(

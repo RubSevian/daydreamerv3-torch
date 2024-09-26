@@ -176,6 +176,16 @@ memorymaze:
   imag_gradient: 'reinforce'
   task: 'memorymaze_9x9'
 
+a1:
+  steps: 4e5
+  encoder: {mlp_keys: 'vector', cnn_keys: '$^'}
+  decoder: {mlp_keys: 'vector', cnn_keys: '$^'}
+  batch_size: 32  # 64
+  envs: 1
+  action_repeat: 50
+  discount: 0.995
+  prefill: 5000
+
 debug:
   debug: True
   pretrain: 1
