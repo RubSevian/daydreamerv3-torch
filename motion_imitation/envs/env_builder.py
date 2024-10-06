@@ -104,7 +104,7 @@ def build_env(enable_rendering=False,
       robot_sensors=sensors,
       task=task)
 
-  env = observation_dictionary_to_array_wrapper.ObservationDictionaryToArrayWrapper(env)
+  # env = observation_dictionary_to_array_wrapper.ObservationDictionaryToArrayWrapper(env)
   env = trajectory_generator_wrapper_env.TrajectoryGeneratorWrapperEnv(env, trajectory_generator=traj_gen)
 
   return env

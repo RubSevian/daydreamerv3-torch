@@ -141,6 +141,7 @@ class LocomotionGymEnv(gym.Env):
     self.observation_space = (
         space_utils.convert_sensors_to_gym_space_dictionary(
             self.all_sensors()))
+    print(f"obs_space: {self.observation_space}")
 
   def _build_action_space(self):
     """Builds action space based on motor control mode."""
@@ -452,8 +453,9 @@ class LocomotionGymEnv(gym.Env):
     for s in self.all_sensors():
       sensors_dict[s.get_name()] = s.get_observation()
 
-    observations = collections.OrderedDict(sorted(list(sensors_dict.items())))
-    return observations
+    # observations = collections.OrderedDict(sorted(list(sensors_dict.items())))
+    # return observations
+    return sensors_dict
 
   def set_time_step(self, num_action_repeat, sim_step=0.001):
     """Sets the time step of the environment.
