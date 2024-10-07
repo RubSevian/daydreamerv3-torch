@@ -144,24 +144,33 @@ def make_dataset(episodes, config):
     return dataset
 
 
-def make_env(config, mode, id):
+def make_env(config, mode, id, is_render):
     suite, task = config.task.split("_", 1)
 
     # ~~~~~~~~~~~~~~~~~~~ real robots ~~~~~~~~~~~~~~~~~~~ #
+    # Because pybullet doesn't support multiple GUI envs
+    # we use is_render
+    # One of the envs must be is_reder = False
     if suite == "a1":
         assert config.size == (64, 64), config.size
         env = LeggedRobot(
-            task, robot_type='A1', repeat=config.action_repeat,
+            task, robot_type='A1',
+            repeat=config.action_repeat,
+            enable_rendering=is_render,
         )
     elif suite == "go1":
         assert config.size == (64, 64), config.size
         env = LeggedRobot(
-            task, robot_type='Go1', repeat=config.action_repeat,
+            task, robot_type='Go1',
+            repeat=config.action_repeat,
+            enable_rendering=is_render,
         )
     elif suite == "aliengo":
         assert config.size == (64, 64), config.size
         env = LeggedRobot(
-            task, robot_type='Aliengo', repeat=config.action_repeat,
+            task, robot_type='Aliengo',
+            repeat=config.action_repeat,
+            enable_rendering=is_render,
         )
     # ~~~~~~~~~~~~~~~~~~~ real robots ~~~~~~~~~~~~~~~~~~~ #
 
@@ -254,9 +263,9 @@ def main(config):
     else:
         directory = config.evaldir
     eval_eps = tools.load_episodes(directory, limit=1)
-    make = lambda mode, id: make_env(config, mode, id)
-    train_envs = [make("train", i) for i in range(config.envs)]
-    eval_envs = [make("eval", i) for i in range(config.envs)]
+    make = lambda mode, id, is_render: make_env(config, mode, id, is_render)
+    train_envs = [make("train", i, True) for i in range(config.envs)]
+    eval_envs = [make("eval", i, False) for i in range(config.envs)]
     if config.parallel:
         train_envs = [Parallel(env, "process") for env in train_envs]
         eval_envs = [Parallel(env, "process") for env in eval_envs]

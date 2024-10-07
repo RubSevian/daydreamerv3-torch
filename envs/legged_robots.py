@@ -12,7 +12,7 @@ class LeggedRobot():
         repeat: int = 1,
         length: int = 1000,
         resets: bool = True,
-        enable_rendering: bool | None = False
+        enable_rendering: bool = True
     ):
         assert robot_type in ("A1", "Go1","Aliengo"), "Incorrect robot type"
         assert task in ("sim", "real"), task
