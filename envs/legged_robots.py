@@ -32,7 +32,10 @@ class LeggedRobot():
         spaces: dict[str, gym.spaces.Box] = {}
         for key, value in self._env.observation_space.items():
             spaces[key] = value
-        spaces['image'] = gym.spaces.Box(0, 255, (64, 64, 3), dtype=np.uint8)
+        spaces["image"] = gym.spaces.Box(0, 255, (64, 64, 3), dtype=np.uint8)
+        spaces["is_first"] = gym.spaces.Box(0, 1, (), dtype=bool)
+        spaces["is_last"] = gym.spaces.Box(0, 1, (), dtype=bool)
+        spaces["is_terminal"] = gym.spaces.Box(0, 1, (), dtype=bool)
         return gym.spaces.Dict(spaces)
 
     @property
@@ -42,11 +45,17 @@ class LeggedRobot():
     def reset(self):
         obs = self._env.reset()
         obs["image"] = self._env.render("rgb_array")
+        obs["is_first"] = True
+        obs["is_last"] = False
+        obs["is_terminal"] = False
         return obs
     
     def step(self, action):
         obs, reward, done, info = self._env.step(action)
         obs["image"] = self._env.render("rgb_array")
+        obs["is_first"] = False
+        obs["is_last"] = done
+        obs["is_terminal"] = False  # TODO: check if it's ok to always return False here
         assert obs["image"].shape == (64, 64, 3), obs["image"].shape
         assert obs["image"].dtype == np.uint8, obs["image"].dtype
         return obs, reward, done, info
