@@ -154,21 +154,27 @@ def make_env(config, mode, id, is_render):
     if suite == "a1":
         assert config.size == (64, 64), config.size
         env = LeggedRobot(
-            task, robot_type='A1',
+            task,
+            config.discount,
+            robot_type='A1',
             repeat=config.action_repeat,
             enable_rendering=is_render,
         )
     elif suite == "go1":
         assert config.size == (64, 64), config.size
         env = LeggedRobot(
-            task, robot_type='Go1',
+            task,
+            config.discount,
+            robot_type='Go1',
             repeat=config.action_repeat,
             enable_rendering=is_render,
         )
     elif suite == "aliengo":
         assert config.size == (64, 64), config.size
         env = LeggedRobot(
-            task, robot_type='Aliengo',
+            task,
+            config.discount,
+            robot_type='Aliengo',
             repeat=config.action_repeat,
             enable_rendering=is_render,
         )
@@ -239,10 +245,13 @@ def main(config):
     logdir = pathlib.Path(config.logdir).expanduser()
     config.traindir = config.traindir or logdir / "train_eps"
     config.evaldir = config.evaldir or logdir / "eval_eps"
-    config.steps //= config.action_repeat
-    config.eval_every //= config.action_repeat
-    config.log_every //= config.action_repeat
-    config.time_limit //= config.action_repeat
+    if not config.sim_or_real_robot:
+        # In robots action_repeat is used just to interpolate
+        # actions between previous and new joint angles
+        config.steps //= config.action_repeat
+        config.eval_every //= config.action_repeat
+        config.log_every //= config.action_repeat
+        config.time_limit //= config.action_repeat
 
     print("Logdir", logdir)
     logdir.mkdir(parents=True, exist_ok=True)
@@ -250,7 +259,8 @@ def main(config):
     config.evaldir.mkdir(parents=True, exist_ok=True)
     step = count_steps(config.traindir)
     # step in logger is environmental step
-    logger = tools.Logger(logdir, config.action_repeat * step)
+    logger_step = (config.action_repeat * step) if not config.sim_or_real_robot else step
+    logger = tools.Logger(logdir, logger_step)
 
     print("Create envs.")
     if config.offline_traindir:
