@@ -7,6 +7,7 @@ defaults:
   offline_evaldir: ''
   seed: 0
   deterministic_run: False
+  sim_or_real_robot: False
   steps: 1e6
   parallel: False
   eval_every: 1e4
@@ -175,6 +176,22 @@ memorymaze:
   actor: {dist: 'onehot', std: 'none'}
   imag_gradient: 'reinforce'
   task: 'memorymaze_9x9'
+
+a1:
+  steps: 1e8
+  encoder: {mlp_keys: '.*', cnn_keys: '$^'}
+  decoder: {mlp_keys: '.*', cnn_keys: '$^'}
+  # batch_size: 32  # 64
+  envs: 1
+  action_repeat: 50
+  eval_every: 1e4
+  eval_episode_num: 3
+  log_every: 1e4
+  discount: 0.995
+  prefill: 5000
+  time_limit: 500
+  sim_or_real_robot: True
+  video_pred_log: false
 
 debug:
   debug: True

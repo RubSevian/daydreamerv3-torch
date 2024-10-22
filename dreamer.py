@@ -16,6 +16,7 @@ import models
 import tools
 import envs.wrappers as wrappers
 from parallel import Parallel, Damy
+from envs.legged_robots import LeggedRobot
 
 import torch
 from torch import nn
@@ -143,9 +144,43 @@ def make_dataset(episodes, config):
     return dataset
 
 
-def make_env(config, mode, id):
+def make_env(config, mode, id, is_render):
     suite, task = config.task.split("_", 1)
-    if suite == "dmc":
+
+    # ~~~~~~~~~~~~~~~~~~~ real robots ~~~~~~~~~~~~~~~~~~~ #
+    # Because pybullet doesn't support multiple GUI envs
+    # we use is_render
+    # One of the envs must be is_reder = False
+    if suite == "a1":
+        assert config.size == (64, 64), config.size
+        env = LeggedRobot(
+            task,
+            config.discount,
+            robot_type='A1',
+            repeat=config.action_repeat,
+            enable_rendering=is_render,
+        )
+    elif suite == "go1":
+        assert config.size == (64, 64), config.size
+        env = LeggedRobot(
+            task,
+            config.discount,
+            robot_type='Go1',
+            repeat=config.action_repeat,
+            enable_rendering=is_render,
+        )
+    elif suite == "aliengo":
+        assert config.size == (64, 64), config.size
+        env = LeggedRobot(
+            task,
+            config.discount,
+            robot_type='Aliengo',
+            repeat=config.action_repeat,
+            enable_rendering=is_render,
+        )
+    # ~~~~~~~~~~~~~~~~~~~ real robots ~~~~~~~~~~~~~~~~~~~ #
+
+    elif suite == "dmc":
         import envs.dmc as dmc
 
         env = dmc.DeepMindControl(
@@ -210,10 +245,13 @@ def main(config):
     logdir = pathlib.Path(config.logdir).expanduser()
     config.traindir = config.traindir or logdir / "train_eps"
     config.evaldir = config.evaldir or logdir / "eval_eps"
-    config.steps //= config.action_repeat
-    config.eval_every //= config.action_repeat
-    config.log_every //= config.action_repeat
-    config.time_limit //= config.action_repeat
+    if not config.sim_or_real_robot:
+        # In robots action_repeat is used just to interpolate
+        # actions between previous and new joint angles
+        config.steps //= config.action_repeat
+        config.eval_every //= config.action_repeat
+        config.log_every //= config.action_repeat
+        config.time_limit //= config.action_repeat
 
     print("Logdir", logdir)
     logdir.mkdir(parents=True, exist_ok=True)
@@ -221,7 +259,8 @@ def main(config):
     config.evaldir.mkdir(parents=True, exist_ok=True)
     step = count_steps(config.traindir)
     # step in logger is environmental step
-    logger = tools.Logger(logdir, config.action_repeat * step)
+    logger_step = (config.action_repeat * step) if not config.sim_or_real_robot else step
+    logger = tools.Logger(logdir, logger_step)
 
     print("Create envs.")
     if config.offline_traindir:
@@ -234,9 +273,9 @@ def main(config):
     else:
         directory = config.evaldir
     eval_eps = tools.load_episodes(directory, limit=1)
-    make = lambda mode, id: make_env(config, mode, id)
-    train_envs = [make("train", i) for i in range(config.envs)]
-    eval_envs = [make("eval", i) for i in range(config.envs)]
+    make = lambda mode, id, is_render: make_env(config, mode, id, is_render)
+    train_envs = [make("train", i, True) for i in range(config.envs)]
+    eval_envs = [make("eval", i, False) for i in range(config.envs)]
     if config.parallel:
         train_envs = [Parallel(env, "process") for env in train_envs]
         eval_envs = [Parallel(env, "process") for env in eval_envs]
