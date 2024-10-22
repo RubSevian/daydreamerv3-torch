@@ -125,6 +125,148 @@ class Logger:
         self._writer.add_video(name, value, step, 16)
 
 
+class Runner:
+    def __init__(self, envs, cache, directory, logger, max_dataset_size) -> None:
+        self._envs = envs
+        self._cache = cache
+        self._directory = directory
+        self._logger = logger
+        self._state = self._initialize_state()
+        self._max_dataset_size = max_dataset_size
+
+    def _initialize_state(self):
+        result = {}
+        result["step"] = 0
+        result["episode"] = 0
+        result["done"] = np.ones(len(self._envs), bool)
+        result["length"] = np.zeros(len(self._envs), np.int32)
+        result["obs"] = [None] * len(self._envs)
+        result["agent_state"] = None
+        result["reward"] = [0] * len(self._envs)
+        return result
+
+    def _reset_envs_and_add_to_cache(self):
+        indices = [index for index, done in enumerate(self._state["done"]) if done]
+        results = [self._envs[i].reset() for i in indices]
+        results = [r() for r in results]
+        for index, result in zip(indices, results):
+            t = result.copy()
+            t = {k: convert(v) for k, v in t.items()}
+            # action will be added to transition in add_to_cache
+            t["reward"] = 0.0
+            t["discount"] = 1.0
+            # initial state should be added to cache
+            add_to_cache(self._cache, self._envs[index].id, t)
+            # replace obs with done by initial state
+            self._state["obs"][index] = result
+        
+    def _step_agent(self, agent, training=True):
+        obs = {k: np.stack([obs[k] for obs in self._state["obs"]]) for k in self._state["obs"][0] if "log_" not in k}
+
+        # FIXME:
+        # Mb for random agent i can't use training arg.
+        action, self._state["agent_state"] = agent(obs, self._state["done"], self._state["agent_state"], training=training)
+        if isinstance(action, dict):
+            action = [
+                {k: np.array(action[k][i].detach().cpu()) for k in action}
+                for i in range(len(self._envs))
+            ]
+        else:
+            action = np.array(action)
+        assert len(action) == len(self._envs)
+
+        return action
+
+    def _add_replay_to_buffer(self, action, results):
+        for a, result, env in zip(action, results, self._envs):
+            o, r, d, info = result
+            o = {k: convert(v) for k, v in o.items()}
+            transition = o.copy()
+            if isinstance(a, dict):
+                transition.update(a)
+            else:
+                transition["action"] = a
+            transition["reward"] = r
+            transition["discount"] = info.get("discount", np.array(1 - float(d)))
+            add_to_cache(self._cache, env.id, transition)
+
+    def _log_info(self, is_eval, episodes, i):
+        length = len(self._cache[self._envs[i].id]["reward"]) - 1
+        score = float(np.array(self._cache[self._envs[i].id]["reward"]).sum())
+        video = self._cache[self._envs[i].id]["image"]
+        # record logs given from environments
+        for key in list(self._cache[self._envs[i].id].keys()):
+            if "log_" in key:
+                self._logger.scalar(
+                    key, float(np.array(self._cache[self._envs[i].id][key]).sum())
+                )
+                # log items won't be used later
+                self._cache[self._envs[i].id].pop(key)
+
+        if not is_eval:
+            step_in_dataset = erase_over_episodes(self._cache, self._max_dataset_size)
+            self._logger.scalar(f"dataset_size", step_in_dataset)
+            self._logger.scalar(f"train_return", score)
+            self._logger.scalar(f"train_length", length)
+            self._logger.scalar(f"train_episodes", len(self._cache))
+            self._logger.write(step=self._logger.step)
+        else:
+            if not "eval_lengths" in locals():
+                eval_lengths = []
+                eval_scores = []
+                eval_done = False
+            # start counting scores for evaluation
+            eval_scores.append(score)
+            eval_lengths.append(length)
+
+            score = sum(eval_scores) / len(eval_scores)
+            length = sum(eval_lengths) / len(eval_lengths)
+            self._logger.video(f"eval_policy", np.array(video)[None])
+
+            if len(eval_scores) >= episodes and not eval_done:
+                self._logger.scalar(f"eval_return", score)
+                self._logger.scalar(f"eval_length", length)
+                self._logger.scalar(f"eval_episodes", len(eval_scores))
+                self._logger.write(step=self._logger.step)
+                eval_done = True
+
+    def run(self, agent, eval_run=False, steps=0, episodes=0):
+        while (steps and self._state["step"] < steps) or (episodes and self._state["episode"] < episodes):
+            # reset envs if necessary
+            if self._state["done"].any():
+                self._reset_envs_and_add_to_cache()
+            
+            # We don't want to train the agent on eval runs
+            action = self._step_agent(agent, eval_run==False)
+            
+            # step envs
+            results = [e.step(a) for e, a in zip(self._envs, action)]
+            results = [r() for r in results]
+            self._state["obs"], self._state["reward"], self._state["done"] = zip(*[p[:3] for p in results])
+
+            # TODO:
+            # check for importance of converting to list
+            self._state["obs"] = list(self._state["obs"])
+            self._state["reward"] = list(self._state["reward"])
+            self._state["done"] = np.stack(self._state["done"])
+            self._state["episode"] += int(self._state["done"].sum())
+            self._state["length"] += 1
+            self._state["step"] += len(self._envs)
+            self._state["length"] *= 1 - self._state["done"]
+            
+            # add to cache
+            self._add_replay_to_buffer(action, results)
+
+            if self._state["done"].any():
+                indices = [index for index, done in enumerate(self._state["done"]) if done]
+                # logging for done episode
+                for i in indices:
+                    save_episodes(self._directory, {self._envs[i].id: self._cache[self._envs[i].id]})
+                    self._log_info(eval_run, episodes, i)
+        self._state["step"] -= steps
+        self._state["episode"] -= episodes
+
+
 def simulate(
     agent,
     envs,

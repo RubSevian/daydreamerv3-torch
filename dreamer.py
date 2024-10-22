@@ -39,6 +39,7 @@ class Dreamer(nn.Module):
         self._should_expl = tools.Until(int(config.expl_until / config.action_repeat))
         self._metrics = {}
         # this is update step
+        # FIXME for robots
         self._step = logger.step // config.action_repeat
         self._update_count = 0
         self._dataset = dataset
@@ -81,6 +82,7 @@ class Dreamer(nn.Module):
 
         if training:
             self._step += len(reset)
+            # FIXME
             self._logger.step = self._config.action_repeat * self._step
         return policy_output, state
 
@@ -317,6 +319,7 @@ def main(config):
             limit=config.dataset_size,
             steps=prefill,
         )
+        # FIXME: for robots we use just prefill
         logger.step += prefill * config.action_repeat
         print(f"Logger: ({logger.step} steps).")
 
