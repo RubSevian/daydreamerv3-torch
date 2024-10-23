@@ -230,14 +230,14 @@ class Runner:
                 self._logger.write(step=self._logger.step)
                 eval_done = True
 
-    def run(self, agent, eval_run=False, steps=0, episodes=0):
+    def run(self, agent, steps=0, episodes=0, is_eval=False):
         while (steps and self._state["step"] < steps) or (episodes and self._state["episode"] < episodes):
             # reset envs if necessary
             if self._state["done"].any():
                 self._reset_envs_and_add_to_cache()
             
             # We don't want to train the agent on eval runs
-            action = self._step_agent(agent, eval_run==False)
+            action = self._step_agent(agent, is_eval==False)
             
             # step envs
             results = [e.step(a) for e, a in zip(self._envs, action)]
@@ -262,9 +262,29 @@ class Runner:
                 # logging for done episode
                 for i in indices:
                     save_episodes(self._directory, {self._envs[i].id: self._cache[self._envs[i].id]})
-                    self._log_info(eval_run, episodes, i)
+                    self._log_info(is_eval, episodes, i)
         self._state["step"] -= steps
         self._state["episode"] -= episodes
+
+    def eval_run(self, agent, steps=0, episodes=0):
+        self.run(agent, steps, episodes, is_eval=True)
+        # keep only last item for saving memory.
+        # this cache is used for video_pred later
+        while len(self._cache) > 1:
+            # FIFO
+            self._cache.popitem(last=False)
+
+
+class EvalRunner(Runner):
+    def eval_run(self, agent, steps=0, episodes=0):
+        self.run(agent, steps, episodes, is_eval=True)
+        # reset states after each evaluation run
+        self._initialize_state()
+        # keep only last item for saving memory.
+        # this cache is used for video_pred later
+        while len(self._cache) > 1:
+            # FIFO
+            self._cache.popitem(last=False)
 
 
 def simulate(
