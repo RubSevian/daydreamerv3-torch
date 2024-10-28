@@ -18,6 +18,9 @@ import envs.wrappers as wrappers
 from parallel import Parallel, Damy
 from envs.legged_robots import LeggedRobot
 
+from queue import Queue
+from threading import Thread, Lock
+
 import torch
 from torch import nn
 from torch import distributions as torchd
@@ -289,6 +292,44 @@ def main(config):
     config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
 
     state = None
+    """
+    train_runner = tools.Runner(
+        train_envs,
+        train_eps,
+        config.traindir,
+        logger,
+        config.dataset_size,
+    )
+    """
+
+    eval_runner = tools.EvalRunner(
+        eval_envs,
+        eval_eps,
+        config.evaldir,
+        logger,
+    )
+    
+    
+    observation_buffer = Queue()
+
+    replay_collector = tools.AsyncReplayCollector(
+        train_envs,
+        train_eps,
+        config.traindir,
+        logger,
+        observation_buffer,
+        config.dataset_size,
+    )
+    learner = tools.AsyncLearner(
+        None,
+        train_eps,
+        config.traindir,
+        logger,
+        observation_buffer,
+        config.dataset_size,
+    )
+    
+
     if not config.offline_traindir:
         prefill = max(0, config.prefill - count_steps(config.traindir))
         print(f"Prefill dataset ({prefill} steps).")
@@ -309,7 +350,12 @@ def main(config):
             action = random_actor.sample()
             logprob = random_actor.log_prob(action)
             return {"action": action, "logprob": logprob}, None
+        
+        # perform prefill here
+        # train_runner.run(random_agent, steps=prefill, prefill_run=True)
+        replay_collector.run(random_agent, steps=prefill, prefill_run=True)
 
+        """
         state = tools.simulate(
             random_agent,
             train_envs,
@@ -319,6 +365,7 @@ def main(config):
             limit=config.dataset_size,
             steps=prefill,
         )
+        """
         # FIXME: for robots we use just prefill
         logger.step += prefill * config.action_repeat
         print(f"Logger: ({logger.step} steps).")
@@ -340,11 +387,17 @@ def main(config):
         tools.recursively_load_optim_state_dict(agent, checkpoint["optims_state_dict"])
         agent._should_pretrain._once = False
 
+    lock = Lock()
     # make sure eval will be executed once after config.steps
     while agent._step < config.steps + config.eval_every:
         logger.write()
+        
         if config.eval_episode_num > 0:
+            print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
             print("Start evaluation.")
+            eval_runner.eval_run(agent, episodes=config.eval_episode_num)
+
+            """
             eval_policy = functools.partial(agent, training=False)
             tools.simulate(
                 eval_policy,
@@ -355,10 +408,34 @@ def main(config):
                 is_eval=True,
                 episodes=config.eval_episode_num,
             )
+            """
             if config.video_pred_log:
                 video_pred = agent._wm.video_pred(next(eval_dataset))
                 logger.video("eval_openl", to_np(video_pred))
+            
+
+        print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
         print("Start training.")
+        # train_runner.run(agent, steps=config.eval_every)
+        time_list = []
+        
+        t1 = Thread(target=replay_collector.run_collect_replay, args=(agent, lock),
+                    kwargs={"steps":config.eval_every})
+        t2 = Thread(target=learner.run_learning, args=(agent,),
+                    kwargs={"steps":config.eval_every})
+
+        t1.start()
+        t2.start()
+
+        print("BOTH THREADS INITIALIZED")
+
+        t1.join()
+        t2.join()
+
+        print("BOTH THREADS JOINED")
+        
+
+        """
         state = tools.simulate(
             agent,
             train_envs,
@@ -369,6 +446,11 @@ def main(config):
             steps=config.eval_every,
             state=state,
         )
+        """
+
+        print("End training.")
+        print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+
         items_to_save = {
             "agent_state_dict": agent.state_dict(),
             "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
