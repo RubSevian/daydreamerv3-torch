@@ -22,6 +22,12 @@ To set up Atari or Minecraft environments, please check the scripts located in [
 ### Method 2: Docker
 
 Please refer to the Dockerfile for the instructions, as they are included within.
+If one want to run training inside docker, for example for a1-robot, use:
+```
+docker run -it --rm --gpus all --net=host --env DISPLAY=$DISPLAY -v $PWD:/workspace dreamerv3 python3 dreamer.py \
+   --configs a1 --task a1_sim \
+   --logdir "./logdir/a1_run"
+```
 
 ## Benchmarks
 So far, the following benchmarks can be used for testing.
