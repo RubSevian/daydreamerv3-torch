@@ -10,8 +10,9 @@ import random
 
 import numpy as np
 from parallel import Parallel, Damy
-from typing import OrderedDict
-from dreamer import Dreamer
+from typing import OrderedDict, Optional
+from threading import Lock
+from queue import Queue
 
 import torch
 from torch import nn
@@ -151,7 +152,7 @@ class Runner:
         result["reward"] = [0] * len(self._envs)  # maybe useless
         return result
 
-    def _reset_envs_and_add_to_cache(self):
+    def _reset_envs_and_add_to_cache(self, lock: Optional[Lock] = None):
         indices = [index for index, done in enumerate(self._state["done"]) if done]
         results = [self._envs[i].reset() for i in indices]
         results = [r() for r in results]
@@ -162,7 +163,11 @@ class Runner:
             t["reward"] = 0.0
             t["discount"] = 1.0
             # initial state should be added to cache
-            add_to_cache(self._cache, self._envs[index].id, t)
+            if lock:
+                with lock:
+                    add_to_cache(self._cache, self._envs[index].id, t)
+            else:
+                add_to_cache(self._cache, self._envs[index].id, t)
             # replace obs with done by initial state
             self._state["obs"][index] = result
         
@@ -186,7 +191,7 @@ class Runner:
         assert len(action) == len(self._envs)
         return action
 
-    def _add_replay_to_buffer(self, action, results):
+    def _add_replay_to_buffer(self, action, results, lock = None):
         for a, result, env in zip(action, results, self._envs):
             o, r, d, info = result
             o = {k: convert(v) for k, v in o.items()}
@@ -197,7 +202,11 @@ class Runner:
                 transition["action"] = a
             transition["reward"] = r
             transition["discount"] = info.get("discount", np.array(1 - float(d)))
-            add_to_cache(self._cache, env.id, transition)
+            if lock:
+                with lock:
+                    add_to_cache(self._cache, env.id, transition)
+            else:
+                add_to_cache(self._cache, env.id, transition)
 
     def _pre_log(self, i) -> float:
         length = len(self._cache[self._envs[i].id]["reward"]) - 1
@@ -221,9 +230,7 @@ class Runner:
         self._logger.scalar(f"train_episodes", len(self._cache))
         self._logger.write(step=self._logger.step)
 
-    def _simulate(self, agent, prefill_run=False, training=True):
-        action = self._step_agent(agent, prefill_run, training)
-        
+    def _step_envs(self, action):
         # step envs
         results = [e.step(a) for e, a in zip(self._envs, action)]
         results = [r() for r in results]
@@ -235,9 +242,7 @@ class Runner:
         self._state["reward"] = list(self._state["reward"])
         self._state["done"] = np.stack(self._state["done"])
         self._state["length"] += 1
-        
-        # add to cache
-        self._add_replay_to_buffer(action, results)
+        return results
 
     def run(self, agent, steps=0, episodes=0, prefill_run=False):
         step = 0
@@ -247,7 +252,11 @@ class Runner:
             if self._state["done"].any():
                 self._reset_envs_and_add_to_cache()
 
-            self._simulate(agent, prefill_run)
+            # main training part
+            action = self._step_agent(agent, prefill_run)
+            results = self._step_envs(action)
+            self._add_replay_to_buffer(action, results)
+
             if self._state["done"].any():
                 indices = [index for index, done in enumerate(self._state["done"]) if done]
                 # logging for done episode
@@ -298,7 +307,10 @@ class EvalRunner(Runner):
             if self._state["done"].any():
                 self._reset_envs_and_add_to_cache()
 
-            self._simulate(agent, training=False)
+            action = self._step_agent(agent, prefill_run=False, training=False)
+            results = self._step_envs(action)
+            self._add_replay_to_buffer(action, results)
+
             if self._state["done"].any():
                 indices = [index for index, done in enumerate(self._state["done"]) if done]
                 # logging for done episode
@@ -315,6 +327,74 @@ class EvalRunner(Runner):
             self._cache.popitem(last=False)
         # reset states after each evaluation run
         self._reset_eval_state()
+
+
+class AsyncReplayCollector(Runner):
+    def __init__(self, envs, cache, directory, logger, obs_buffer: Queue, max_dataset_size = None):
+        super().__init__(envs, cache, directory, logger, max_dataset_size)
+        self._observation_buffer: Queue = obs_buffer
+
+    def run_collect_replay(self, agent, lock: Lock, steps=0, episodes=0):
+        """
+        TODO: Add description
+        """
+
+        step = 0
+        episode = 0
+        while (steps and step < steps) or (episodes and episode < episodes):
+            # reset envs before agent step if necessary
+            if self._state["done"].any():
+                self._reset_envs_and_add_to_cache(lock)
+
+            action = self._step_agent(agent, prefill_run=False, training=False)
+            results = self._step_envs(action)
+            self._add_replay_to_buffer(action, results, lock)
+
+            if self._state["done"].any():
+                indices = [index for index, done in enumerate(self._state["done"]) if done]
+                # logging for done episode
+                for i in indices:
+                    save_episodes(self._directory, {self._envs[i].id: self._cache[self._envs[i].id]})
+                    self._log_train_info(i)
+            step += len(self._envs)
+            episode += int(self._state["done"].sum())
+
+            obs_cache = {k: self._state[k] for k in ["obs", "done"]}
+            # only the collector updates step/episode
+            # the learner will use collector's step/episode
+            obs_cache["step"] = step
+            obs_cache["episode"] = episode
+            self._observation_buffer.put(obs_cache)
+
+
+class AsyncLearner(Runner):
+    def __init__(self, envs, cache, directory, logger, obs_buffer: Queue, max_dataset_size = None):
+        super().__init__(envs, cache, directory, logger, max_dataset_size)
+        self._observation_buffer: Queue = obs_buffer
+
+    def _initialize_state(self):
+        result = {}
+        result["agent_state"] = None
+        return result
+
+    def _async_step_agent(self, agent, observation, done) -> None:
+        obs = {k: np.stack([obs[k] for obs in observation]) for k in observation[0] if "log_" not in k}
+        _, self._state["agent_state"] = agent(obs, done, self._state["agent_state"], training=True)
+
+    def run_learning(self, agent, steps=0, episodes=0):
+        """
+        TODO: Add description
+        """
+
+        step = 0
+        episode = 0
+        while (steps and step < steps) or (episodes and episode < episodes):
+            data = self._observation_buffer.get(timeout=3)
+            step = data["step"]
+            episode = data["episode"]
+
+            self._async_step_agent(agent, data["obs"], data["done"])
+
 
 
 def simulate(
