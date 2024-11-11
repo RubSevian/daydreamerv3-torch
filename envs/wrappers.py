@@ -26,6 +26,20 @@ class TimeLimit(gym.Wrapper):
         return self.env.reset()
 
 
+class DaydreamerTimeLimit(TimeLimit):
+    def step(self, action):
+        assert self._step is not None, "Must reset environment."
+        obs, reward, done, info = self.env.step(action)
+        self._step += 1
+        if self._step >= self._duration:
+            done = True
+            obs["is_last"] = True
+            if "discount" not in info:
+                info["discount"] = np.array(1.0).astype(np.float32)
+            self._step = None
+        return obs, reward, done, info
+
+
 class NormalizeActions(gym.Wrapper):
     def __init__(self, env):
         super().__init__(env)
