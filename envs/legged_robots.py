@@ -60,3 +60,7 @@ class LeggedRobot():
         assert obs["image"].shape == (64, 64, 3), obs["image"].shape
         assert obs["image"].dtype == np.uint8, obs["image"].dtype
         return obs, reward, done, info
+    
+    def close(self):
+        print("Closing env")
+        self._env.close()
