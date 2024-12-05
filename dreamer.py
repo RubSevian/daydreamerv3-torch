@@ -17,9 +17,8 @@ import tools
 import envs.wrappers as wrappers
 from parallel import Parallel, Damy
 from envs.legged_robots import LeggedRobot
-
-from queue import Queue
-from threading import Thread, Lock
+import replay_buffer.replay as replay
+from replay_buffer.fixed_length import FixedLength
 
 import torch
 from torch import nn
@@ -27,6 +26,8 @@ from torch import distributions as torchd
 
 
 to_np = lambda x: x.detach().cpu().numpy()
+
+LEARNER_ADDRES = 'localhost:2222'
 
 
 class Dreamer(nn.Module):
@@ -42,7 +43,7 @@ class Dreamer(nn.Module):
         self._should_expl = tools.Until(int(config.expl_until / config.action_repeat))
         self._metrics = {}
         # this is update step
-        # FIXME for robots
+        # FIXME
         self._step = logger.step // config.action_repeat
         self._update_count = 0
         self._dataset = dataset
@@ -85,9 +86,29 @@ class Dreamer(nn.Module):
 
         if training:
             self._step += len(reset)
-            # FIXME
             self._logger.step = self._config.action_repeat * self._step
         return policy_output, state
+
+    def train(self):
+        step = self._logger.step
+
+        steps = (
+            self._config.pretrain
+            if self._should_pretrain()
+            else self._should_train(step)
+        )
+        for _ in range(steps):
+            self._train(next(self._dataset))
+            self._update_count += 1
+            self._metrics["update_count"] = self._update_count
+        if self._should_log(step):
+            for name, values in self._metrics.items():
+                self._logger.scalar(name, float(np.mean(values)))
+                self._metrics[name] = []
+            if self._config.video_pred_log:
+                openl = self._wm.video_pred(next(self._dataset))
+                self._logger.video("train_openl", to_np(openl))
+            self._logger.write(fps=True)
 
     def _policy(self, obs, state, training):
         if state is None:
@@ -144,9 +165,30 @@ def count_steps(folder):
 
 
 def make_dataset(episodes, config):
-    generator = tools.sample_episodes(episodes, config.batch_length)
+    if config.sim_or_real_robot:
+        generator = episodes.dataset()
+    else:
+        generator = tools.sample_episodes(episodes, config.batch_length)
     dataset = tools.from_generator(generator, config.batch_size)
     return dataset
+
+
+def make_replay(
+    config, directory=None, is_eval=False, remote_addr=None, server_port=None
+):
+
+    size = config.dataset_size
+    if is_eval:
+        size //= 10
+    if remote_addr:
+        store = replay.StoreClient(remote_addr)
+    else:
+        store = replay.CkptRAMStore(directory, size)
+    store = replay.Stats(store)
+    if server_port:
+        store = replay.StoreServer(store, server_port)
+    replay_buffer = FixedLength(store, chunk=config.batch_length)
+    return replay_buffer
 
 
 def make_env(config, mode, id, is_render):
@@ -154,7 +196,6 @@ def make_env(config, mode, id, is_render):
 
     # ~~~~~~~~~~~~~~~~~~~ real robots ~~~~~~~~~~~~~~~~~~~ #
     # Because pybullet doesn't support multiple GUI envs
-    # we use is_render
     # One of the envs must be is_reder = False
     if suite == "a1":
         assert config.size == (64, 64), config.size
@@ -235,7 +276,11 @@ def make_env(config, mode, id, is_render):
         env = wrappers.OneHotAction(env)
     else:
         raise NotImplementedError(suite)
-    env = wrappers.TimeLimit(env, config.time_limit)
+    if config.sim_or_real_robot:
+        # A slightly different TimeLimit wrapper is used for daydreamer
+        env = wrappers.DaydreamerTimeLimit(env, config.time_limit)
+    else:
+        env = wrappers.TimeLimit(env, config.time_limit)
     env = wrappers.SelectAction(env, key="action")
     env = wrappers.UUID(env)
     if suite == "minecraft":
@@ -243,6 +288,143 @@ def make_env(config, mode, id, is_render):
     return env
 
 
+def daydreamer(config):
+    tools.set_seed_everywhere(config.seed)
+    if config.deterministic_run:
+        tools.enable_deterministic_run()
+    logdir = pathlib.Path(config.logdir).expanduser()
+    config.traindir = config.traindir or logdir / "train_eps"
+    config.evaldir = config.evaldir or logdir / "eval_eps"
+    config.syncdir = config.syncdir or logdir / "sync_weights"
+
+    print("Logdir", logdir)
+    logdir.mkdir(parents=True, exist_ok=True)
+    config.traindir.mkdir(parents=True, exist_ok=True)
+    config.evaldir.mkdir(parents=True, exist_ok=True)
+    config.syncdir.mkdir(parents=True, exist_ok=True)
+    step = count_steps(config.traindir)
+    # step in logger is environmental step
+    logger = tools.Logger(logdir, step, config.action_repeat, config.sim_or_real_robot)
+
+    print("Create envs.")
+    make = lambda mode, id, is_render: make_env(config, mode, id, is_render)
+
+    if config.async_run == "learning":
+        port = LEARNER_ADDRES.split(':')[-1]
+        replay_buffer = make_replay(config, config.traindir, server_port=port)
+        train_dataset = make_dataset(replay_buffer, config)
+
+        learner = tools.AsyncLearner(
+            replay_buffer,
+            logdir,
+            config.syncdir,
+            logger,
+            config.sync_every,
+            config.save_every,
+        )
+
+        train_envs = [make("train", i, False) for i in range(config.envs)]
+        # eval_envs = [make("eval", i, False) for i in range(config.envs)]  # TODO: add eval
+        train_envs = [Damy(env) for env in train_envs]
+        # eval_envs = [Damy(env) for env in eval_envs]
+        acts = train_envs[0].action_space
+        config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
+
+        agent = Dreamer(
+        train_envs[0].observation_space,
+        train_envs[0].action_space,
+        config,
+        logger,
+        train_dataset,
+        ).to(config.device)
+        agent.requires_grad_(requires_grad=False)
+        if (logdir / "latest.pt").exists():
+            checkpoint = torch.load(logdir / "latest.pt")
+            agent.load_state_dict(checkpoint["agent_state_dict"])
+            tools.recursively_load_optim_state_dict(agent, checkpoint["optims_state_dict"])
+            agent._should_pretrain._once = False
+
+        # close the environments because they are not used during learning
+        for env in train_envs:
+            try:
+                env.close()
+            except Exception as e:
+                print("Something happend on env.close()", e)
+
+        learner.run(agent, config.prefill, config.steps)
+        
+    elif config.async_run == "acting":
+        replay_buffer = make_replay(config, remote_addr=LEARNER_ADDRES)
+
+        train_envs = [make("train", i, True) for i in range(config.envs)]
+        # eval_envs = [make("eval", i, False) for i in range(config.envs)]
+        train_envs = [Damy(env) for env in train_envs]
+        # eval_envs = [Damy(env) for env in eval_envs]
+        acts = train_envs[0].action_space
+        print("Action Space", acts)
+        config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
+            
+        replay_collector = tools.AsyncReplayCollector(
+            train_envs,
+            replay_buffer,
+            config.traindir,
+            config.syncdir,
+            logger,
+            config.sync_every,
+        )
+
+        prefill = max(0, config.prefill - count_steps(config.traindir))
+        if prefill > 0:
+            print(f"Prefill dataset ({prefill} steps).")
+            if hasattr(acts, "discrete"):
+                random_actor = tools.OneHotDist(
+                    torch.zeros(config.num_actions).repeat(config.envs, 1)
+                )
+            else:
+                random_actor = torchd.independent.Independent(
+                    torchd.uniform.Uniform(
+                        torch.Tensor(acts.low).repeat(config.envs, 1),
+                        torch.Tensor(acts.high).repeat(config.envs, 1),
+                    ),
+                    1,
+                )
+
+            def random_agent(o, d, s):
+                action = random_actor.sample()
+                logprob = random_actor.log_prob(action)
+                return {"action": action, "logprob": logprob}, None
+            
+            # perform prefill here
+            replay_collector.run(random_agent, prefill, prefill_run=True)
+
+        agent = Dreamer(
+        train_envs[0].observation_space,
+        train_envs[0].action_space,
+        config,
+        logger,
+        None,
+        ).to(config.device)
+        agent.requires_grad_(requires_grad=False)
+        if (logdir / "latest.pt").exists():
+            checkpoint = torch.load(logdir / "latest.pt")
+            agent.load_state_dict(checkpoint["agent_state_dict"])
+            tools.recursively_load_optim_state_dict(agent, checkpoint["optims_state_dict"])
+            agent._should_pretrain._once = False
+
+        print(f"Logger: ({logger.step} steps).")
+        print("Start training")
+        replay_collector.run(agent, config.steps)
+
+        items_to_save = {
+            "agent_state_dict": agent.state_dict(),
+            "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
+        }
+        torch.save(items_to_save, logdir / "latest.pt")        
+    else:
+        raise RuntimeError("Unknown parameter for the run argument")
+
+
+# FIXME
 def main(config):
     tools.set_seed_everywhere(config.seed)
     if config.deterministic_run:
@@ -250,13 +432,10 @@ def main(config):
     logdir = pathlib.Path(config.logdir).expanduser()
     config.traindir = config.traindir or logdir / "train_eps"
     config.evaldir = config.evaldir or logdir / "eval_eps"
-    if not config.sim_or_real_robot:
-        # In robots action_repeat is used just to interpolate
-        # actions between previous and new joint angles
-        config.steps //= config.action_repeat
-        config.eval_every //= config.action_repeat
-        config.log_every //= config.action_repeat
-        config.time_limit //= config.action_repeat
+    config.steps //= config.action_repeat
+    config.eval_every //= config.action_repeat
+    config.log_every //= config.action_repeat
+    config.time_limit //= config.action_repeat
 
     print("Logdir", logdir)
     logdir.mkdir(parents=True, exist_ok=True)
@@ -264,8 +443,8 @@ def main(config):
     config.evaldir.mkdir(parents=True, exist_ok=True)
     step = count_steps(config.traindir)
     # step in logger is environmental step
-    logger_step = (config.action_repeat * step) if not config.sim_or_real_robot else step
-    logger = tools.Logger(logdir, logger_step)
+    logger_step = (config.action_repeat * step)
+    logger = tools.Logger(logdir, logger_step, config.action_repeat, config.sim_or_real_robot)
 
     print("Create envs.")
     if config.offline_traindir:
@@ -290,9 +469,7 @@ def main(config):
     acts = train_envs[0].action_space
     print("Action Space", acts)
     config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
-
-    state = None
-    """
+    
     train_runner = tools.Runner(
         train_envs,
         train_eps,
@@ -300,35 +477,13 @@ def main(config):
         logger,
         config.dataset_size,
     )
-    """
-
+ 
     eval_runner = tools.EvalRunner(
         eval_envs,
         eval_eps,
         config.evaldir,
         logger,
     )
-    
-    
-    observation_buffer = Queue()
-
-    replay_collector = tools.AsyncReplayCollector(
-        train_envs,
-        train_eps,
-        config.traindir,
-        logger,
-        observation_buffer,
-        config.dataset_size,
-    )
-    learner = tools.AsyncLearner(
-        None,
-        train_eps,
-        config.traindir,
-        logger,
-        observation_buffer,
-        config.dataset_size,
-    )
-    
 
     if not config.offline_traindir:
         prefill = max(0, config.prefill - count_steps(config.traindir))
@@ -352,21 +507,8 @@ def main(config):
             return {"action": action, "logprob": logprob}, None
         
         # perform prefill here
-        # train_runner.run(random_agent, steps=prefill, prefill_run=True)
-        replay_collector.run(random_agent, steps=prefill, prefill_run=True)
+        train_runner.run(random_agent, steps=prefill, prefill_run=True)
 
-        """
-        state = tools.simulate(
-            random_agent,
-            train_envs,
-            train_eps,
-            config.traindir,
-            logger,
-            limit=config.dataset_size,
-            steps=prefill,
-        )
-        """
-        # FIXME: for robots we use just prefill
         logger.step += prefill * config.action_repeat
         print(f"Logger: ({logger.step} steps).")
 
@@ -387,15 +529,14 @@ def main(config):
         tools.recursively_load_optim_state_dict(agent, checkpoint["optims_state_dict"])
         agent._should_pretrain._once = False
 
-    lock = Lock()
     # make sure eval will be executed once after config.steps
     while agent._step < config.steps + config.eval_every:
         logger.write()
         
         if config.eval_episode_num > 0:
-            print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-            print("Start evaluation.")
-            eval_runner.eval_run(agent, episodes=config.eval_episode_num)
+            # print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+            # print("Start evaluation.")
+            # eval_runner.eval_run(agent, episodes=config.eval_episode_num)
 
             """
             eval_policy = functools.partial(agent, training=False)
@@ -408,32 +549,13 @@ def main(config):
                 is_eval=True,
                 episodes=config.eval_episode_num,
             )
-            """
+            
             if config.video_pred_log:
                 video_pred = agent._wm.video_pred(next(eval_dataset))
                 logger.video("eval_openl", to_np(video_pred))
-            
+            """
 
-        print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-        print("Start training.")
-        # train_runner.run(agent, steps=config.eval_every)
-        time_list = []
-        
-        t1 = Thread(target=replay_collector.run_collect_replay, args=(agent, lock),
-                    kwargs={"steps":config.eval_every})
-        t2 = Thread(target=learner.run_learning, args=(agent,),
-                    kwargs={"steps":config.eval_every})
-
-        t1.start()
-        t2.start()
-
-        print("BOTH THREADS INITIALIZED")
-
-        t1.join()
-        t2.join()
-
-        print("BOTH THREADS JOINED")
-        
+        train_runner.run(agent, config.eval_every)
 
         """
         state = tools.simulate(
@@ -486,4 +608,8 @@ if __name__ == "__main__":
     for key, value in sorted(defaults.items(), key=lambda x: x[0]):
         arg_type = tools.args_type(value)
         parser.add_argument(f"--{key}", type=arg_type, default=arg_type(value))
-    main(parser.parse_args(remaining))
+    config = parser.parse_args(remaining)
+    if config.sim_or_real_robot:
+        daydreamer(config)
+    else:
+        main(config)
