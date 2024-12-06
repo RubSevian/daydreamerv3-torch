@@ -178,6 +178,8 @@ class LocomotionGymEnv(gym.Env):
   def close(self):
     if hasattr(self, '_robot') and self._robot:
       self._robot.Terminate()
+    self._pybullet_client.resetSimulation()
+    self.pybullet_client.disconnect()
 
   def seed(self, seed=None):
     self.np_random, self.np_random_seed = seeding.np_random(seed)

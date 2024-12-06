@@ -3,6 +3,7 @@ defaults:
   logdir: null
   traindir: null
   evaldir: null
+  syncdir: null
   offline_traindir: ''
   offline_evaldir: ''
   seed: 0
@@ -184,14 +185,16 @@ a1:
   # batch_size: 32  # 64
   envs: 1
   action_repeat: 50
-  eval_every: 1e4
+  eval_every: 1e5
   eval_episode_num: 3
   log_every: 1e4
   discount: 0.995
-  prefill: 5000
+  prefill: 2000
   time_limit: 500
   sim_or_real_robot: True
   video_pred_log: false
+  sync_every: 150
+  save_every: 2000
 
 debug:
   debug: True

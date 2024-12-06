@@ -9,6 +9,8 @@ import time
 import random
 
 import numpy as np
+from parallel import Parallel, Damy
+from typing import OrderedDict, Optional
 
 import torch
 from torch import nn
@@ -55,7 +57,7 @@ class TimeRecording:
 
 
 class Logger:
-    def __init__(self, logdir, step):
+    def __init__(self, logdir, step, action_repeat, is_daydreamer):
         self._logdir = logdir
         self._writer = SummaryWriter(log_dir=str(logdir), max_queue=1000)
         self._last_step = None
@@ -63,10 +65,26 @@ class Logger:
         self._scalars = {}
         self._images = {}
         self._videos = {}
+        self._action_repeat = action_repeat
+        self._is_daydreamer = is_daydreamer
         self.step = step
 
     def scalar(self, name, value):
         self._scalars[name] = float(value)
+    
+    def increment_step(self):
+        # for daydreamer (aka for the real robot),
+        # the action_repeat value should't be considered
+        # for the logger step, as it is used only
+        # to interpolate between two joint positions
+        if self._is_daydreamer:
+            self.step += 1
+        else:
+            self.step += 1 * self._action_repeat
+
+    @property
+    def is_daydreamer(self):
+        return self._is_daydreamer
 
     def image(self, name, value):
         self._images[name] = np.array(value)
@@ -123,6 +141,483 @@ class Logger:
         B, T, H, W, C = value.shape
         value = value.transpose(1, 4, 2, 0, 3).reshape((1, T, C, H, B * W))
         self._writer.add_video(name, value, step, 16)
+
+
+class Runner:
+    """
+    A class used to manage the learning process
+
+    ...
+
+    Attributes
+    ----------
+    envs : list[Parallel] | list[Damy]
+        gym envs wrapped in Parallel or Damy
+    cache : OrderedDict
+        replay buffer returned by load_episodes function
+        looks like {env.id: {"MotorAngle": [...], "IMU": [...], ...}}
+    directory : pathlib.Path
+        directory from config.traindir
+        (usually config.logdir/"train_eps")
+    logger : Logger
+    max_dataset_size : None | int
+        maximum number of items in the lists inside the cache
+    """
+
+    def __init__(
+        self,
+        envs: list[Parallel] | list[Damy],
+        cache: OrderedDict,
+        directory: pathlib.Path,
+        logger: Logger,
+        max_dataset_size: None | int = None,
+    ) -> None:
+        self._envs = envs
+        self._cache = cache
+        self._directory = directory
+        self._logger = logger
+        self._state = self._initialize_state()
+        self._max_dataset_size = max_dataset_size
+
+    def _initialize_state(self):
+        result = {}
+        result["done"] = np.ones(len(self._envs), bool)
+        result["length"] = np.zeros(len(self._envs), np.int32)  # maybe useless
+        result["obs"] = [None] * len(self._envs)
+        result["agent_state"] = None
+        result["reward"] = [0] * len(self._envs)  # maybe useless
+        return result
+
+    def _reset_envs(self):
+        indices = [index for index, done in enumerate(self._state["done"]) if done]
+        results = [self._envs[i].reset() for i in indices]
+        results = [r() for r in results]
+        return_dict = {}
+        for index, result in zip(indices, results):
+            t = result.copy()
+            t = {k: convert(v) for k, v in t.items()}
+            # action will be added to transition in add_to_cache
+            t["reward"] = 0.0
+            t["discount"] = 1.0
+            # initial state should be added to cache
+            return_dict[self._envs[index].id] = t
+            # replace obs with done by initial state
+            self._state["obs"][index] = result
+        return return_dict
+
+    def _step_agent(self, agent, prefill_run: bool, training: bool = True):
+        obs = {k: np.stack([obs[k] for obs in self._state["obs"]]) for k in self._state["obs"][0] if "log_" not in k}
+
+        # agents other than Dreamer may not have the training arg
+        # a different agent is used during the prefill run
+        if not prefill_run:
+            action, self._state["agent_state"] = agent(obs, self._state["done"], self._state["agent_state"], training=training)
+        else:
+            action, self._state["agent_state"] = agent(obs, self._state["done"], self._state["agent_state"])
+
+        if isinstance(action, dict):
+            action = [
+                {k: np.array(action[k][i].detach().cpu()) for k in action}
+                for i in range(len(self._envs))
+            ]
+        else:
+            action = np.array(action)
+        assert len(action) == len(self._envs)
+        return action
+
+    def _prepare_replay(self, action, results):
+        return_dict = {}
+        for a, result, env in zip(action, results, self._envs):
+            o, r, d, info = result
+            o = {k: convert(v) for k, v in o.items()}
+            transition = o.copy()
+            if isinstance(a, dict):
+                transition.update(a)
+            else:
+                transition["action"] = a
+            transition["reward"] = r
+            transition["discount"] = info.get("discount", np.array(1 - float(d)))
+            return_dict[env.id] = transition
+        return return_dict
+
+    def _pre_log(self, i) -> float:
+        length = len(self._cache[self._envs[i].id]["reward"]) - 1
+        score = float(np.array(self._cache[self._envs[i].id]["reward"]).sum())
+        # record logs given from environments
+        for key in list(self._cache[self._envs[i].id].keys()):
+            if "log_" in key:
+                self._logger.scalar(
+                    key, float(np.array(self._cache[self._envs[i].id][key]).sum())
+                )
+                # log items won't be used later
+                self._cache[self._envs[i].id].pop(key)
+        return length, score
+
+    def _log_train_info(self, i):
+        length, score = self._pre_log(i)
+        step_in_dataset = erase_over_episodes(self._cache, self._max_dataset_size)
+        self._logger.scalar(f"dataset_size", step_in_dataset)
+        self._logger.scalar(f"train_return", score)
+        self._logger.scalar(f"train_length", length)
+        self._logger.scalar(f"train_episodes", len(self._cache))
+        self._logger.write(step=self._logger.step)
+
+    def _step_envs(self, action):
+        # step envs
+        results = [e.step(a) for e, a in zip(self._envs, action)]
+        results = [r() for r in results]
+        self._state["obs"], self._state["reward"], self._state["done"] = zip(*[p[:3] for p in results])
+
+        # TODO:
+        # check for importance of converting to list
+        self._state["obs"] = list(self._state["obs"])
+        self._state["reward"] = list(self._state["reward"])
+        self._state["done"] = np.stack(self._state["done"])
+        self._state["length"] += 1
+        return results
+
+    def run(self, agent, steps=0, episodes=0, prefill_run=False):
+        """Interacts with the gym env and collects replay
+
+        Parameters
+        ----------
+        agent : Dreamer or random_agent
+        steps : int
+            The number of training steps to be performed
+            (It doesn't take action_reapeat into account like a normal Dreamer does)
+        episodes : int
+            The number of training episodes to be performed
+        prefill_run : bool
+            Usually random_agent is used to execute prefill_run
+        """
+
+        step = 0
+        episode = 0
+        while (steps and step < steps) or (episodes and episode < episodes):
+            # reset envs before agent step if necessary
+            if self._state["done"].any():
+                transition = self._reset_envs()
+                for key, value in transition.items():
+                    add_to_cache(self._cache, key, value)
+
+            # main training part
+            action = self._step_agent(agent, prefill_run)
+            results = self._step_envs(action)
+            t = self._prepare_replay(action, results)
+            for key, value in t.items():
+                add_to_cache(self._cache, key, value)
+            self._logger.increment_step()
+
+            if self._state["done"].any():
+                indices = [index for index, done in enumerate(self._state["done"]) if done]
+                # logging for done episode
+                for i in indices:
+                    save_episodes(self._directory, {self._envs[i].id: self._cache[self._envs[i].id]})
+                    self._log_train_info(i)
+            step += len(self._envs)
+            episode += int(self._state["done"].sum())
+
+
+class EvalRunner(Runner):
+    """
+    A class used to manage the evaluation process
+
+    ...
+
+    Attributes
+    ----------
+    envs : list[Parallel] | list[Damy]
+        gym envs wrapped in Parallel or Damy
+    cache : OrderedDict
+        replay buffer returned by load_episodes function
+        looks like {env.id: {"MotorAngle": [...], "IMU": [...], ...}}
+    directory : pathlib.Path
+        directory from config.evaldir
+        (usually config.logdir/"eval_eps")
+    logger : Logger
+    max_dataset_size : None | int
+        maximum number of items in the lists inside the cache
+    """
+
+    def __init__(self, envs, cache, directory, logger, max_dataset_size = None):
+        super().__init__(envs, cache, directory, logger, max_dataset_size)
+        self._eval_lengths = []
+        self._eval_scores = []
+        self._eval_done = False
+
+    def _log_eval_info(self, i, episodes):
+        length, score = self._pre_log(i)
+        video = self._cache[self._envs[i].id]["image"]
+
+        # start counting scores for evaluation
+        self._eval_scores.append(score)
+        self._eval_lengths.append(length)
+
+        mean_score = sum(self._eval_scores) / len(self._eval_scores)
+        mean_length = sum(self._eval_lengths) / len(self._eval_lengths)
+        self._logger.video(f"eval_policy", np.array(video)[None])
+
+        if len(self._eval_scores) >= episodes and not self._eval_done:
+            self._logger.scalar(f"eval_return", mean_score)
+            self._logger.scalar(f"eval_length", mean_length)
+            self._logger.scalar(f"eval_episodes", len(self._eval_scores))
+            self._logger.write(step=self._logger.step)
+            self._eval_done = True
+
+    def _reset_eval_state(self):
+        super()._initialize_state()
+        self._eval_lengths = []
+        self._eval_scores = []
+        self._eval_done = False
+
+    def eval_run(self, agent, steps=0, episodes=0):
+        step = 0
+        episode = 0
+        while (steps and step < steps) or (episodes and episode < episodes):
+            # reset envs before agent step if necessary
+            if self._state["done"].any():
+                transition = self._reset_envs()
+                for key, value in transition.items():
+                    add_to_cache(self._cache, key, value)
+
+            # main part
+            action = self._step_agent(agent, prefill_run=False, training=False)
+            results = self._step_envs(action)
+            t = self._prepare_replay(action, results)
+            for key, value in t.items():
+                add_to_cache(self._cache, key, value)
+
+            if self._state["done"].any():
+                indices = [index for index, done in enumerate(self._state["done"]) if done]
+                # logging for done episode
+                for i in indices:
+                    save_episodes(self._directory, {self._envs[i].id: self._cache[self._envs[i].id]})
+                    self._log_eval_info(i, episodes)
+            step += len(self._envs)
+            episode += int(self._state["done"].sum())
+
+        # keep only last item for saving memory.
+        # this cache is used for video_pred later
+        while len(self._cache) > 1:
+            # FIFO
+            self._cache.popitem(last=False)
+        # reset states after each evaluation run
+        self._reset_eval_state()
+
+
+class AsyncReplayCollector(Runner):
+    """
+    A class used to interact with envs and collect replay,
+    but not training the agent
+
+    ...
+
+    Attributes
+    ----------
+    envs : list[Parallel] | list[Damy]
+        gym envs wrapped in Parallel or Damy
+    cache : FixedLength
+        replay buffer returned by dreamer.make_replay() function
+        looks like {env.id: {"MotorAngle": [...], "IMU": [...], ...}}
+    directory : pathlib.Path
+        directory from config.traindir
+        (usually config.logdir/"train_eps")
+    sync_directory: pathlib.Path
+        directory from config.syncdir
+        (usually config.logdir/"sync_weights")
+    logger : Logger
+    sync_every : int
+        once in sync_every steps to load weights from the trained agent
+        from AsyncLearner
+    max_dataset_size : None
+        is not used here
+    """
+
+    def __init__(self, envs, cache, directory, sync_directory, logger, sync_every, max_dataset_size = None):
+        super().__init__(envs, cache, directory, logger, max_dataset_size)
+        self._sync_every = sync_every
+        self._sync_directory = sync_directory
+        assert self._logger.is_daydreamer
+
+    def _log_actor_info(self, episode: dict[str, list]):
+        length = len(episode["reward"])
+        score = float(np.array(episode["reward"]).sum())
+        self._logger.scalar(f"train_episodes", self._cache.stats["replay_episodes"])
+        self._logger.scalar(f"train_return", score)
+        self._logger.scalar(f"train_length", length)
+        self._logger.write(step=self._logger.step)
+
+    def run(
+        self, agent, steps: int = 0, episodes: int = 0, prefill_run: bool = False
+    ):
+        """Interacts with the gym env (or real robot) and collects replay
+
+        Parameters
+        ----------
+        agent : Dreamer or random_agent
+        steps : int
+            The number of training steps to be performed
+            (It doesn't take action_reapeat into account like a normal Dreamer does)
+        episodes : int
+            The number of training episodes to be performed
+        prefill_run : bool
+            Usually random_agent is used to execute prefill_run
+        """
+
+        step = 0
+        episode = 0
+        episodes_cache = collections.defaultdict(lambda: collections.defaultdict(list))
+        while (steps and step < steps) or (episodes and episode < episodes):
+            # reset envs before agent step if necessary
+            if self._state["done"].any():
+                self._reset_envs()
+
+            action = self._step_agent(agent, prefill_run, training=False)
+            results = self._step_envs(action)
+            transition = self._prepare_replay(action, results)
+            # transition is {env.id: {"MotorAngle": [...], "IMU": [...], ...}}
+            for key, value in transition.items():
+                self._cache.add(value, key)
+                # store the transition for logging after done
+                [episodes_cache[key][k].append(v) for k, v in value.items()]
+            self._logger.increment_step()
+
+            if self._state["done"].any():
+                indices = [index for index, done in enumerate(self._state["done"]) if done]
+                # logging for done episode
+                for i in indices:
+                    save_episodes(self._directory, {self._envs[i].id: episodes_cache[self._envs[i].id]})
+                    self._log_actor_info(episodes_cache[self._envs[i].id])
+                    # clear the episodes_cache for the env that received the done flag
+                    episodes_cache[self._envs[i].id].clear()
+
+            if not prefill_run and step % self._sync_every == 0:
+                while not (self._sync_directory / "latest_sync.pt").exists():
+                    print("[AsyncReplayCollector] Waiting for agent checkpoint to be created")
+                    time.sleep(10)
+                print(f"[{self._logger.step}][AsyncReplayCollector] Syncing")
+                try:  # to avoid simultaneously saving and loading the state dict
+                    checkpoint = torch.load(self._sync_directory / "latest_sync.pt", weights_only=True)
+                    agent.load_state_dict(checkpoint["agent_state_dict"])
+                except Exception as e:
+                    print(f"[{self._logger.step}][AsyncReplayCollector] {e}")
+            
+            step += len(self._envs)
+            episode += int(self._state["done"].sum())
+
+
+class AsyncLearner:
+    """
+    A class used to train the agent by sampling replay from the cache
+    ...
+
+    Attributes
+    ----------
+    cache : FixedLength
+        eplay buffer returned by dreamer.make_replay() function
+        looks like {env.id: {"MotorAngle": [...], "IMU": [...], ...}}
+    directory : pathlib.Path
+        directory from config.logdir
+    sync_directory: pathlib.Path
+        directory from config.syncdir
+        (usually config.logdir/"sync_weights")
+    logger : Logger
+    sync_every : int
+        once in sync_every steps to save agent weights
+    save_every : int
+        once in sync_every steps to save agent parameters
+        this is necessary to restore training from the checkpoint
+    """
+
+    def __init__(self, cache, directory, sync_directory, logger: Logger, sync_every, save_every):
+        self._cache = cache
+        self._directory = directory
+        self._logger: Logger = logger
+        self._sync_every = sync_every
+        self._sync_directory = sync_directory
+        self._save_every = save_every
+        assert self._logger.is_daydreamer
+
+    def run(self, agent, prefill_steps, steps):
+        """Trains the agent by sampling replay from the cache
+
+        Parameters
+        ----------
+        agent : Dreamer
+        prefill_steps : int
+            it just waits for the cache to prefill the prefill_steps amount of data
+            to avoid overfitting on a small amount of initial data
+        steps : int
+            The number of training steps to be performed
+        """
+
+        # Wait for prefill data from at least one actor to avoid overfitting to only
+        # small amount of data that is read first.
+        while len(self._cache) < prefill_steps:
+            print(
+                'Waiting for train data prefill '
+                f'({len(self._cache)}/{prefill_steps})...')
+            time.sleep(30)
+
+        while self._logger.step < steps:
+            agent.train()
+            self._logger.increment_step()
+            if self._logger.step % self._sync_every == 0:
+                print(f"[{self._logger.step}][AsyncLearner] Syncing")
+                torch.save(
+                    {"agent_state_dict": agent.state_dict()},
+                    self._sync_directory / "latest_sync.pt",
+                )
+            # saving checkpoints
+            if self._logger.step % self._save_every == 0:
+                items_to_save = {
+                    "agent_state_dict": agent.state_dict(),
+                    "optims_state_dict": recursively_collect_optim_state_dict(agent),
+                }
+                torch.save(items_to_save, self._directory / "latest.pt")
+
+
+class DEPRECATEDAsyncLearner(Runner):
+    """
+    To delete
+    """
+    def __init__(self, envs, cache, directory, sync_directory, logger, sync_every, max_dataset_size = None):
+        super().__init__(envs, cache, directory, logger, max_dataset_size)
+        self._sync_every = sync_every
+        self._sync_directory = sync_directory
+        assert self._logger.is_daydreamer
+
+    def _initialize_state(self):
+        result = {}
+        result["agent_state"] = None
+        return result
+
+    def _async_step_agent(self, agent, observation, done) -> None:
+        obs = {k: np.stack([obs[k] for obs in observation]) for k in observation[0] if "log_" not in k}
+        _, self._state["agent_state"] = agent(obs, done, self._state["agent_state"], training=True)
+
+    def run_learning(self, agent, prefill_steps, steps=0):
+        """
+        TODO: Add description
+        """
+
+        # Wait for prefill data from at least one actor to avoid overfitting to only
+        # small amount of data that is read first.
+        while len(self._cache) < prefill_steps:
+            print(
+                'Waiting for train data prefill '
+                f'({len(self._cache)}/{prefill_steps})...')
+            time.sleep(30)
+
+        while self._logger.step < steps:
+            agent.train()
+            self._logger.increment_step()
+            if self._logger.step % self._sync_every == 0:
+                print(f"[{self._logger.step}][AsyncLearner] Syncing")
+                torch.save(
+                    {"agent_state_dict": agent.state_dict()},
+                    self._sync_directory / "latest_sync.pt",
+                )
 
 
 def simulate(

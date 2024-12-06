@@ -1,9 +1,13 @@
 # dreamerv3-torch
-Pytorch implementation of [Mastering Diverse Domains through World Models](https://arxiv.org/abs/2301.04104v1). DreamerV3 is a scalable algorithm that outperforms previous approaches across various domains with fixed hyperparameters.
+Pytorch implementation of [Daydreamer](https://github.com/danijar/daydreamer) only for quadrupedal robots. Based on Pytorch implementation of [DreamerV3](https://github.com/NM512/dreamerv3-torch).
 
-## Instructions
+In addition to adding Daydreamer features, the [DreamerV3](https://github.com/NM512/dreamerv3-torch) features are fully preserved (but not everything has been tested).
 
-### Method 1: Manual
+The project is not very well tested yet, but one can use it as a starting point at least.
+
+## Instructions for DreamerV3
+
+### Method 1: Manual (not tested)
 
 Get dependencies with python 3.11:
 ```
@@ -19,9 +23,64 @@ tensorboard --logdir ./logdir
 ```
 To set up Atari or Minecraft environments, please check the scripts located in [env/setup_scripts](https://github.com/NM512/dreamerv3-torch/tree/main/envs/setup_scripts).
 
-### Method 2: Docker
+### Method 2: Docker (tested)
 
-Please refer to the Dockerfile for the instructions, as they are included within.
+If one want to run training inside docker, for example for a1-robot, use:
+```
+docker run -it --rm --gpus all --net=host --env DISPLAY=$DISPLAY -v $PWD:/workspace dreamerv3 python3 dreamer.py \
+   --configs dmc_vision --task dmc_walker_walk \
+   --logdir "./logdir/dmc_walker_walk"
+```
+For more info please refer to the Dockerfile.
+
+## Instructions for DayDreamer
+
+### Method 1: Manual (not tested)
+
+Get dependencies with python 3.11:
+```
+pip install -r requirements.txt
+```
+__Run training on a1__
+In the first terminal, run:
+```
+python3 dreamer.py --configs a1 --task a1_sim --async_run learning --logdir ./logdir/a1
+```
+In the second terminal, run:
+```
+python3 dreamer.py --configs a1 --task a1_sim --async_run acting --logdir ./logdir/a1
+```
+__Monitor results__
+In the third terminal, run:
+```
+tensorboard --logdir ./logdir
+```
+
+### Method 2: Docker (tested)
+
+__Build docker image from Dockerfile__
+From the root directory of the project, run:
+```
+docker build -t dreamerv3 .  
+```
+__Run training on a1__
+In the first terminal, run:
+```
+docker run --name dreamerv3 -it --rm --gpus all --net=host --env DISPLAY=$DISPLAY -v $PWD:/workspace dreamerv3 python3 dreamer.py \
+   --configs a1 --task a1_sim --async_run learning \
+   --logdir "./logdir/a1"
+```
+In the second terminal, run:
+```
+docker exec -it dreamerv3 python3 dreamer.py \
+   --configs a1 --task a1_sim --async_run acting \
+   --logdir "./logdir/a1"
+```
+__Monitor results__
+In the third terminal, run:
+```
+tensorboard --logdir ./logdir
+```
 
 ## Benchmarks
 So far, the following benchmarks can be used for testing.
@@ -34,21 +93,7 @@ So far, the following benchmarks can be used for testing.
 | [Minecraft](https://github.com/minerllabs/minerl) | Image and State |Discrete |100M| Vast 3D open world.|
 | [Memory Maze](https://github.com/jurgisp/memory-maze) | Image |Discrete |100M| 3D mazes to evaluate RL agents' long-term memory.|
 
-## Results
-#### DMC Proprio
-![dmcproprio](imgs/dmcproprio.png)
-#### DMC Vision
-![dmcvision](imgs/dmcvision.png)
-#### Atari 100k
-![atari100k](imgs/atari100k.png)
-
-#### Crafter
-<img src="https://github.com/NM512/dreamerv3-torch/assets/70328564/a0626038-53f6-4300-a622-7ac257f4c290" width="300" height="150" />
-
 ## Acknowledgments
 This code is heavily inspired by the following works:
-- danijar's Dreamer-v3 jax implementation: https://github.com/danijar/dreamerv3
-- danijar's Dreamer-v2 tensorflow implementation: https://github.com/danijar/dreamerv2
-- jsikyoon's Dreamer-v2 pytorch implementation: https://github.com/jsikyoon/dreamer-torch
-- RajGhugare19's Dreamer-v2 pytorch implementation: https://github.com/RajGhugare19/dreamerv2
-- denisyarats's DrQ-v2 original implementation: https://github.com/facebookresearch/drqv2
+- danijar's DayDreamer tensorflow implementation: https://github.com/danijar/daydreamer
+- NM512's dreamerv3-torch pytroch implementation of DreanerV3: https://github.com/danijar/daydreamer
