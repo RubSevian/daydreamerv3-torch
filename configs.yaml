@@ -4,6 +4,7 @@ defaults:
   traindir: null
   evaldir: null
   syncdir: null
+  async_run: null
   offline_traindir: ''
   offline_evaldir: ''
   seed: 0
@@ -179,22 +180,44 @@ memorymaze:
   task: 'memorymaze_9x9'
 
 a1:
-  steps: 1e8
+  steps: 5e5
   encoder: {mlp_keys: '.*', cnn_keys: '$^'}
   decoder: {mlp_keys: '.*', cnn_keys: '$^'}
   # batch_size: 32  # 64
+  # batch_length: 32
   envs: 1
   action_repeat: 50
   eval_every: 1e5
   eval_episode_num: 3
   log_every: 1e4
   discount: 0.995
-  prefill: 2000
+  prefill: 5000
   time_limit: 500
+  sim_or_real_robot: True
+  video_pred_log: false
+  sync_every: 250
+  save_every: 2000
+  # imag_horizon: 1
+
+go1:
+  steps: 1e8
+  encoder: {mlp_keys: '.*', cnn_keys: '$^'}
+  decoder: {mlp_keys: '.*', cnn_keys: '$^'}
+  batch_size: 32  # 64
+  batch_length: 32
+  envs: 1
+  action_repeat: 100
+  eval_every: 1e5
+  eval_episode_num: 3
+  log_every: 1e4
+  discount: 0.995
+  prefill: 5000
+  time_limit: 250
   sim_or_real_robot: True
   video_pred_log: false
   sync_every: 150
   save_every: 2000
+  # imag_horizon: 1
 
 debug:
   debug: True
