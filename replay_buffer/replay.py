@@ -101,12 +101,13 @@ class DiskStore:
     # TODO: It can take a while for the trajectory to be written and it causes
     # a not found error if the user tries to access the episode before that.
     t1 = threading.Thread(target=self._save, args=(filename, traj), daemon=True)
+    # FIXME: broken filename format
     print("[DiskStore] Starting save thread")  # TODO: log it with logging
     t1.start()
 
   def __delitem__(self, key):
     filename = self.filenames.pop(key)
-    _, _, length, _ = self._parse(filename)
+    _, _, length = self._parse(filename)
     self.steps -= length
 
   def sync(self):
@@ -114,7 +115,7 @@ class DiskStore:
     selected = {}
     steps = 0
     for filename in reversed(filenames):
-      _, key, length, _ = self._parse(filename)
+      _, key, length = self._parse(filename)
       if self.capacity and steps + length > self.capacity:
         break
       selected[key] = filename
@@ -140,18 +141,15 @@ class DiskStore:
       del self[next(iter(self.filenames.keys()))]
 
   def _format(self, key, traj):
-    time = timelib.strftime('%Y%m%dT%H%M%S', timelib.gmtime(timelib.time()))
     length = len(next(iter(traj.values())))
-    reward = str(int(traj['reward'].sum())).replace('-', 'm')
-    return self.directory / f'{time}-{key}-len{length}-rew{reward}.npz'
+    return self.directory / f'{key}-{length}.npz'
 
   def _parse(self, filename):
-    time, key, length, reward = filename.stem.split('-')
+    time, key, length = filename.stem.split('-')
     time = timelib.mktime(timelib.strptime(
         time, '%Y%m%dT%H%M%S')) - timelib.timezone
     length = int(length.strip('len'))
-    reward = int(reward.strip('rew').replace('m', '-'))
-    return time, key, length, reward
+    return time, key, length
 
 
 class CkptRAMStore:
