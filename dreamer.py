@@ -330,6 +330,9 @@ def daydreamer(config):
         acts = train_envs[0].action_space
         config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
 
+        with open(logdir / 'run_config.txt', 'w') as f:
+            print(config, file=f)
+
         agent = Dreamer(
         train_envs[0].observation_space,
         train_envs[0].action_space,
