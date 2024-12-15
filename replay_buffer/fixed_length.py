@@ -35,16 +35,17 @@ class FixedLength:
         ep = self.ongoing[env_id]
         [ep[k].append(v) for k, v in tran.items()]
         if tran["is_last"] or (self.length and len(ep["is_first"]) >= self.length):
-            self.add_traj(self.ongoing.pop(env_id))
+            self.add_traj(self.ongoing.pop(env_id), env_id)
 
-    def add_traj(self, traj):
+    def add_traj(self, traj, env_id):
+        # env_id is "timestamp-uuid"
         length = len(next(iter(traj.values())))
         if length < self.chunk or length < self.minlen:
             print(f"Skipping short trajectory of length {length}.")
             return
         traj = {k: v for k, v in traj.items() if not k.startswith("log_")}
         traj = {k: convert(v) for k, v in traj.items()}
-        self.store[uuid.uuid4().hex] = traj
+        self.store[env_id] = traj
 
     def dataset(self):
         while True:
