@@ -442,9 +442,11 @@ class AsyncReplayCollector(Runner):
     def _log_actor_info(self, episode: dict[str, list]):
         length = len(episode["reward"])
         score = float(np.array(episode["reward"]).sum())
+        mean_reward = score / length
         self._logger.scalar(f"train_episodes", self._cache.stats["replay_episodes"])
         self._logger.scalar(f"train_return", score)
         self._logger.scalar(f"train_length", length)
+        self._logger.scalar(f"mean_reward", mean_reward)
         self._logger.write(step=self._logger.step)
 
     def run(
@@ -486,7 +488,6 @@ class AsyncReplayCollector(Runner):
                 indices = [index for index, done in enumerate(self._state["done"]) if done]
                 # logging for done episode
                 for i in indices:
-                    save_episodes(self._directory, {self._envs[i].id: episodes_cache[self._envs[i].id]})
                     self._log_actor_info(episodes_cache[self._envs[i].id])
                     # clear the episodes_cache for the env that received the done flag
                     episodes_cache[self._envs[i].id].clear()
