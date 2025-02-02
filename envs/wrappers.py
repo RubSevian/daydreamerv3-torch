@@ -2,7 +2,8 @@ import datetime
 import gym
 import numpy as np
 import uuid
-
+import pygame
+import time
 
 class TimeLimit(gym.Wrapper):
     def __init__(self, env, duration):
@@ -129,3 +130,76 @@ class UUID(gym.Wrapper):
         timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
         self.id = f"{timestamp}-{str(uuid.uuid4().hex)}"
         return self.env.reset()
+
+KEY_PAUSE = pygame.K_p
+KEY_CONTINUE = pygame.K_c
+KEY_RESET = pygame.K_r
+
+class KBReset(gym.Wrapper):
+
+  def __init__(self,env):
+    super().__init__(env)
+    pygame.init()
+    self._screen = pygame.display.set_mode((800, 600))
+    self._set_color((128, 128, 128))
+    self._paused = False
+
+
+  def step(self, action):
+    pressed_last = self._get_pressed()
+    #pressed_now = pygame.key.get_pressed()
+
+    if self._paused:
+        waiting = not (KEY_CONTINUE in pressed_last or KEY_RESET in pressed_last)
+        hard = KEY_RESET in pressed_last
+        while waiting:
+            pressed = self._get_pressed()
+            if KEY_CONTINUE in pressed or KEY_RESET in pressed:
+                waiting = False
+                hard = KEY_RESET in pressed
+            self._set_color((255, 0, 0))  # Красный для паузы
+            time.sleep(0.1)
+
+        reset_action = action.get('reset', False) 
+        if reset_action:
+            #print(f"ACTION:{action.get('reset')}")
+
+            # assert reset_action, action
+                # Проверяем, что действие действительно сброс
+            if not reset_action:
+                raise ValueError(f"Invalid reset action: {action}")
+        self._paused = False
+
+        if hard:
+            self.env.close() # Закрыди старое окружение , а потом запускаем новое 
+            self.env = self.env.unwrapped  # Для пересоздания среду (окружение)
+        obs, reward, done, info = self.env.step({**action, 'manual_resume': True})
+        return obs, reward, done, info  # Требуется кортеж для gym.Env
+
+    if KEY_PAUSE in pressed_last:
+        self._set_color((255, 0, 0))  # Красный для паузы
+        self._paused = True
+        obs, reward, done, info = self.env.step({**action, 'manual_pause': True})
+        return obs, reward, True, info  # происходит завершение эпизода
+
+    self._set_color((128, 128, 128)) 
+    obs, reward, done, info = self.env.step(action)
+
+    sparse_rewards = [-1, 1, 10]
+    if any(r - 0.01 < reward < r + 0.01 for r in sparse_rewards):  # Теперь reward из кортежа
+        extra_info = f' | gripper_pos={info.get("gripper_pos", "N/A")}'  # Берем из info
+        print(f'NON-ZERO REWARD: {reward}{extra_info}')
+
+    return obs, reward, done, info  # Возвращаем корректный gym-кортеж
+
+  def _get_pressed(self):
+    pressed = []
+    pygame.event.pump()
+    for event in pygame.event.get():
+      if event.type == pygame.KEYDOWN:
+        pressed.append(event.key)
+    return pressed
+
+  def _set_color(self, color):
+    self._screen.fill(color)
+    pygame.display.flip()

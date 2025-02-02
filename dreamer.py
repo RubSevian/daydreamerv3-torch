@@ -285,6 +285,8 @@ def make_env(config, mode, id, is_render):
     env = wrappers.UUID(env)
     if suite == "minecraft":
         env = wrappers.RewardObs(env)
+    if config.kbreset: # check config
+        env = wrappers.KBReset(env) # Add pause
     return env
 
 

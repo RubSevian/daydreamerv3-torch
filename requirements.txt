@@ -15,3 +15,5 @@ tensorboard==2.17.1
 pybullet==3.2.6
 filterpy==1.4.5
 pyzmq==26.0.3
+pygame==2.6.0
+pyusb

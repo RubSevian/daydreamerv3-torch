@@ -198,6 +198,7 @@ a1:
   sync_every: 250
   save_every: 2000
   # imag_horizon: 1
+  kbreset: True
 
 go1:
   steps: 1e8
@@ -218,6 +219,7 @@ go1:
   sync_every: 150
   save_every: 2000
   # imag_horizon: 1
+  kbreset: True
 
 debug:
   debug: True
